@@ -9,6 +9,7 @@ APP_NAME = "Buzz"
 class Settings:
     def __init__(self):
         self.settings = QSettings(APP_NAME)
+        self.settings.sync()
 
     class Key(enum.Enum):
         RECORDING_TRANSCRIBER_TASK = "recording-transcriber/task"
@@ -29,6 +30,12 @@ class Settings:
 
         SHORTCUTS = "shortcuts"
 
+        TRANSCRIPTION_TASKS_TABLE_COLUMN_VISIBILITY = (
+            "transcription-tasks-table/column-visibility"
+        )
+
+        MAIN_WINDOW = "main-window"
+
     def set_value(self, key: Key, value: typing.Any) -> None:
         self.settings.setValue(key.value, value)
 
@@ -46,3 +53,12 @@ class Settings:
 
     def clear(self):
         self.settings.clear()
+
+    def begin_group(self, group: Key) -> None:
+        self.settings.beginGroup(group.value)
+
+    def end_group(self) -> None:
+        self.settings.endGroup()
+
+    def sync(self):
+        self.settings.sync()

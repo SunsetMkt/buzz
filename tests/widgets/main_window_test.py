@@ -69,7 +69,7 @@ class TestMainWindow:
 
         table_widget: QTableWidget = window.findChild(QTableWidget)
         qtbot.wait_until(
-            self._assert_task_status(table_widget, 0, "Completed"),
+            self.get_assert_task_status_callback(table_widget, 0, "Completed"),
             timeout=2 * 60 * 1000,
         )
 
@@ -79,28 +79,26 @@ class TestMainWindow:
         assert open_transcript_action.isEnabled()
         window.close()
 
-    # @pytest.mark.skip(reason='Timing out or crashing')
     def test_should_run_and_cancel_transcription_task(self, qtbot, tasks_cache):
         window = MainWindow(tasks_cache=tasks_cache)
         qtbot.add_widget(window)
 
-        self._start_new_transcription(window)
+        self._start_new_transcription(window, long_audio=True)
 
         table_widget: QTableWidget = window.findChild(QTableWidget)
 
-        def assert_task_in_progress():
-            assert table_widget.rowCount() > 0
-            assert table_widget.item(0, 1).text() == "whisper-french.mp3"
-            assert "In Progress" in table_widget.item(0, 2).text()
-
-        qtbot.wait_until(assert_task_in_progress, timeout=2 * 60 * 1000)
+        qtbot.wait_until(
+            self.get_assert_task_status_callback(table_widget, 0, "In Progress"),
+            timeout=2 * 60 * 1000,
+        )
 
         # Stop task in progress
         table_widget.selectRow(0)
         window.toolbar.stop_transcription_action.trigger()
 
         qtbot.wait_until(
-            self._assert_task_status(table_widget, 0, "Canceled"), timeout=60 * 1000
+            self.get_assert_task_status_callback(table_widget, 0, "Canceled"),
+            timeout=60 * 1000,
         )
 
         table_widget.selectRow(0)
@@ -117,15 +115,15 @@ class TestMainWindow:
         table_widget: QTableWidget = window.findChild(QTableWidget)
         assert table_widget.rowCount() == 3
 
-        assert table_widget.item(0, 2).text() == "Completed"
+        assert table_widget.item(0, 4).text() == "Completed"
         table_widget.selectRow(0)
         assert window.toolbar.open_transcript_action.isEnabled()
 
-        assert table_widget.item(1, 2).text() == "Canceled"
+        assert table_widget.item(1, 4).text() == "Canceled"
         table_widget.selectRow(1)
         assert window.toolbar.open_transcript_action.isEnabled() is False
 
-        assert table_widget.item(2, 2).text() == "Failed (Error)"
+        assert table_widget.item(2, 4).text() == "Failed (Error)"
         table_widget.selectRow(2)
         assert window.toolbar.open_transcript_action.isEnabled() is False
         window.close()
@@ -206,12 +204,16 @@ class TestMainWindow:
         window.close()
 
     @staticmethod
-    def _start_new_transcription(window: MainWindow):
+    def _start_new_transcription(window: MainWindow, long_audio: bool = False):
         with patch(
             "PyQt6.QtWidgets.QFileDialog.getOpenFileNames"
         ) as open_file_names_mock:
             open_file_names_mock.return_value = (
-                [get_test_asset("whisper-french.mp3")],
+                [
+                    get_test_asset(
+                        "audio-long.mp3" if long_audio else "whisper-french.mp3"
+                    )
+                ],
                 "",
             )
             new_transcription_action = TestMainWindow._get_toolbar_action(
@@ -226,15 +228,22 @@ class TestMainWindow:
         run_button.click()
 
     @staticmethod
-    def _assert_task_status(
-        table_widget: QTableWidget, row_index: int, expected_status: str
+    def get_assert_task_status_callback(
+        table_widget: QTableWidget,
+        row_index: int,
+        expected_status: str,
+        long_audio: bool = False,
     ):
-        def assert_task_canceled():
+        def assert_task_status():
             assert table_widget.rowCount() > 0
-            assert table_widget.item(row_index, 1).text() == "whisper-french.mp3"
-            assert expected_status in table_widget.item(row_index, 2).text()
+            assert (
+                table_widget.item(row_index, 1).text() == "audio-long.mp3"
+                if long_audio
+                else "whisper-french.mp3"
+            )
+            assert expected_status in table_widget.item(row_index, 4).text()
 
-        return assert_task_canceled
+        return assert_task_status
 
     @staticmethod
     def _get_toolbar_action(window: MainWindow, text: str):

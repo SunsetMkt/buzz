@@ -2,6 +2,8 @@ import logging
 import os
 import pathlib
 import platform
+import shutil
+import sys
 import tempfile
 import time
 from typing import List
@@ -21,11 +23,12 @@ from buzz.transcriber import (
     WhisperCpp,
     WhisperCppFileTranscriber,
     WhisperFileTranscriber,
-    get_default_output_file_path,
+    get_output_file_path,
     to_timestamp,
     whisper_cpp_params,
     write_output,
     TranscriptionOptions,
+    OpenAIWhisperAPIFileTranscriber,
 )
 from buzz.recording_transcriber import RecordingTranscriber
 from tests.mock_sounddevice import MockInputStream
@@ -70,6 +73,43 @@ class TestRecordingTranscriber:
         assert "Bienvenue dans Passe" in text
 
 
+class TestOpenAIWhisperAPIFileTranscriber:
+    @pytest.fixture
+    def mock_openai_client(self):
+        with patch("buzz.transcriber.OpenAI") as mock:
+            return_value = {"segments": [{"start": 0, "end": 6.56, "text": "Hello"}]}
+            mock.return_value.audio.transcriptions.create.return_value = return_value
+            mock.return_value.audio.translations.create.return_value = return_value
+            yield mock
+
+    def test_transcribe(self, mock_openai_client):
+        file_path = "testdata/whisper-french.mp3"
+        transcriber = OpenAIWhisperAPIFileTranscriber(
+            task=FileTranscriptionTask(
+                file_path=file_path,
+                transcription_options=(
+                    TranscriptionOptions(
+                        openai_access_token=os.getenv("OPENAI_ACCESS_TOKEN"),
+                    )
+                ),
+                file_transcription_options=(
+                    FileTranscriptionOptions(file_paths=[file_path])
+                ),
+                model_path="",
+            )
+        )
+        mock_completed = Mock()
+        transcriber.completed.connect(mock_completed)
+        transcriber.run()
+
+        called_segments = mock_completed.call_args[0][0]
+
+        assert len(called_segments) == 1
+        assert called_segments[0].start == 0
+        assert called_segments[0].end == 6560
+        assert called_segments[0].text == "Hello"
+
+
 class TestWhisperCppFileTranscriber:
     @pytest.mark.parametrize(
         "word_level_timings,expected_segments",
@@ -108,10 +148,15 @@ class TestWhisperCppFileTranscriber:
         )
         mock_progress = Mock(side_effect=lambda value: print("progress: ", value))
         mock_completed = Mock()
+        mock_error = Mock()
         transcriber.progress.connect(mock_progress)
         transcriber.completed.connect(mock_completed)
-        with qtbot.waitSignal(transcriber.completed, timeout=10 * 60 * 1000):
+        transcriber.error.connect(mock_error)
+
+        with qtbot.wait_signal(transcriber.completed, timeout=10 * 60 * 1000):
             transcriber.run()
+
+        mock_error.assert_not_called()
 
         mock_progress.assert_called()
         segments = [
@@ -127,24 +172,34 @@ class TestWhisperCppFileTranscriber:
 
 class TestWhisperFileTranscriber:
     @pytest.mark.parametrize(
-        "output_format,expected_file_path,default_output_file_name",
+        "file_path,output_format,expected_file_path,default_output_file_name",
         [
-            (
+            pytest.param(
+                "/a/b/c.mp4",
                 OutputFormat.SRT,
                 "/a/b/c-translate--Whisper-tiny.srt",
                 "{{ input_file_name }}-{{ task }}-{{ language }}-{{ model_type }}-{{ model_size }}",
+                marks=pytest.mark.skipif(platform.system() == "Windows", reason=""),
+            ),
+            pytest.param(
+                "C:\\a\\b\\c.mp4",
+                OutputFormat.SRT,
+                "C:\\a\\b\\c-translate--Whisper-tiny.srt",
+                "{{ input_file_name }}-{{ task }}-{{ language }}-{{ model_type }}-{{ model_size }}",
+                marks=pytest.mark.skipif(platform.system() != "Windows", reason=""),
             ),
         ],
     )
-    def test_default_output_file2(
+    def test_default_output_file(
         self,
+        file_path: str,
         output_format: OutputFormat,
         expected_file_path: str,
         default_output_file_name: str,
     ):
-        file_path = get_default_output_file_path(
+        file_path = get_output_file_path(
             task=FileTranscriptionTask(
-                file_path="/a/b/c.mp4",
+                file_path=file_path,
                 transcription_options=TranscriptionOptions(task=Task.TRANSLATE),
                 file_transcription_options=FileTranscriptionOptions(
                     file_paths=[], default_output_file_name=default_output_file_name
@@ -155,10 +210,27 @@ class TestWhisperFileTranscriber:
         )
         assert file_path == expected_file_path
 
-    def test_default_output_file(self):
-        srt = get_default_output_file_path(
+    @pytest.mark.parametrize(
+        "file_path,expected_starts_with",
+        [
+            pytest.param(
+                "/a/b/c.mp4",
+                "/a/b/c (Translated on ",
+                marks=pytest.mark.skipif(platform.system() == "Windows", reason=""),
+            ),
+            pytest.param(
+                "C:\\a\\b\\c.mp4",
+                "C:\\a\\b\\c (Translated on ",
+                marks=pytest.mark.skipif(platform.system() != "Windows", reason=""),
+            ),
+        ],
+    )
+    def test_default_output_file_with_date(
+        self, file_path: str, expected_starts_with: str
+    ):
+        srt = get_output_file_path(
             task=FileTranscriptionTask(
-                file_path="/a/b/c.mp4",
+                file_path=file_path,
                 transcription_options=TranscriptionOptions(task=Task.TRANSLATE),
                 file_transcription_options=FileTranscriptionOptions(
                     file_paths=[],
@@ -168,12 +240,13 @@ class TestWhisperFileTranscriber:
             ),
             output_format=OutputFormat.TXT,
         )
-        assert srt.startswith("/a/b/c (Translated on ")
+
+        assert srt.startswith(expected_starts_with)
         assert srt.endswith(".txt")
 
-        srt = get_default_output_file_path(
+        srt = get_output_file_path(
             task=FileTranscriptionTask(
-                file_path="/a/b/c.mp4",
+                file_path=file_path,
                 transcription_options=TranscriptionOptions(task=Task.TRANSLATE),
                 file_transcription_options=FileTranscriptionOptions(
                     file_paths=[],
@@ -183,7 +256,7 @@ class TestWhisperFileTranscriber:
             ),
             output_format=OutputFormat.SRT,
         )
-        assert srt.startswith("/a/b/c (Translated on ")
+        assert srt.startswith(expected_starts_with)
         assert srt.endswith(".srt")
 
     @pytest.mark.parametrize(
@@ -246,6 +319,9 @@ class TestWhisperFileTranscriber:
             ),
         ],
     )
+    @pytest.mark.skipif(
+        sys.platform == "linux", reason="Avoid execstack errors on Snap"
+    )
     def test_transcribe(
         self,
         qtbot: QtBot,
@@ -294,6 +370,46 @@ class TestWhisperFileTranscriber:
             assert segments[i].end > 0
             assert len(segments[i].text) > 0
             logging.debug(f"{segments[i].start} {segments[i].end} {segments[i].text}")
+
+    @pytest.mark.skipif(
+        sys.platform == "linux", reason="Avoid execstack errors on Snap"
+    )
+    def test_transcribe_from_folder_watch_source(self, qtbot):
+        file_path = tempfile.mktemp(suffix=".mp3")
+        shutil.copy("testdata/whisper-french.mp3", file_path)
+
+        file_transcription_options = FileTranscriptionOptions(
+            file_paths=[file_path],
+            output_formats={OutputFormat.TXT},
+            default_output_file_name="{{ input_file_name }}",
+        )
+        transcription_options = TranscriptionOptions()
+        model_path = get_model_path(transcription_options.model)
+
+        output_directory = tempfile.mkdtemp()
+        transcriber = WhisperFileTranscriber(
+            task=FileTranscriptionTask(
+                model_path=model_path,
+                transcription_options=transcription_options,
+                file_transcription_options=file_transcription_options,
+                file_path=file_path,
+                output_directory=output_directory,
+                source=FileTranscriptionTask.Source.FOLDER_WATCH,
+            )
+        )
+        with qtbot.wait_signal(transcriber.completed, timeout=10 * 6000):
+            transcriber.run()
+
+        assert not os.path.isfile(file_path)
+        assert os.path.isfile(
+            os.path.join(output_directory, os.path.basename(file_path))
+        )
+        assert os.path.isfile(
+            os.path.join(
+                output_directory,
+                os.path.splitext(os.path.basename(file_path))[0] + ".txt",
+            )
+        )
 
     @pytest.mark.skip()
     def test_transcribe_stop(self):

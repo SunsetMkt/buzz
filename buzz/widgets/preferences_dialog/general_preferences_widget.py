@@ -1,10 +1,8 @@
-import logging
 from typing import Optional
 
-import openai
 from PyQt6.QtCore import QRunnable, QObject, pyqtSignal, QThreadPool
 from PyQt6.QtWidgets import QWidget, QFormLayout, QPushButton, QMessageBox
-from openai.error import AuthenticationError
+from openai import AuthenticationError, OpenAI
 
 from buzz.store.keyring_store import KeyringStore
 from buzz.widgets.line_edit import LineEdit
@@ -40,7 +38,7 @@ class GeneralPreferencesWidget(QWidget):
         )
         self.update_test_openai_api_key_button()
 
-        layout.addRow("OpenAI API Key", self.openai_api_key_line_edit)
+        layout.addRow("OpenAI API key", self.openai_api_key_line_edit)
         layout.addRow("", self.test_openai_api_key_button)
 
         default_export_file_name_line_edit = LineEdit(default_export_file_name, self)
@@ -96,8 +94,8 @@ class TestOpenAIApiKeyJob(QRunnable):
 
     def run(self):
         try:
-            openai.Model.list(api_key=self.api_key)
+            client = OpenAI(api_key=self.api_key)
+            client.models.list()
             self.signals.success.emit()
         except AuthenticationError as exc:
-            logging.error(exc)
-            self.signals.failed.emit(str(exc))
+            self.signals.failed.emit(exc.body["message"])

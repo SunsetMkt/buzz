@@ -5,9 +5,6 @@ mac_app_path := ./dist/Buzz.app
 mac_zip_path := ./dist/Buzz-${version}-mac.zip
 mac_dmg_path := ./dist/Buzz-${version}-mac.dmg
 
-bundle_linux: dist/Buzz
-	bash scripts/bundle_linux.sh
-
 bundle_windows: dist/Buzz
 	iscc //DAppVersion=${version} installer.iss
 
@@ -31,8 +28,13 @@ clean:
 	rm -f buzz/whisper_cpp.py
 	rm -rf dist/* || true
 
+COVERAGE_THRESHOLD := 75
+ifeq ($(UNAME_S),Linux)
+	COVERAGE_THRESHOLD := 70
+endif
+
 test: buzz/whisper_cpp.py translation_mo
-	pytest -vv --cov=buzz --cov-report=xml --cov-report=html --benchmark-skip
+	pytest -vv --cov=buzz --cov-report=xml --cov-report=html --benchmark-skip --cov-fail-under=${COVERAGE_THRESHOLD}
 
 benchmarks: buzz/whisper_cpp.py translation_mo
 	pytest -vv --benchmark-only --benchmark-json benchmarks.json

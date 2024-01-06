@@ -3,8 +3,10 @@ import datetime
 import enum
 import json
 import logging
+import math
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,30 +17,23 @@ from random import randint
 from threading import Thread
 from typing import Any, List, Optional, Tuple, Union, Set
 
-import faster_whisper
 import numpy as np
-import openai
-import stable_whisper
+from openai import OpenAI
+
 import tqdm
-import whisper
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from dataclasses_json import dataclass_json, config, Exclude
-from whisper import tokenizer
 
-from . import transformers_whisper
+from buzz.model_loader import whisper_cpp
+from . import transformers_whisper, whisper_audio
 from .conn import pipe_stderr
+from .locale import _
 from .model_loader import TranscriptionModel, ModelType
 
-# Catch exception from whisper.dll not getting loaded.
-# TODO: Remove flag and try-except when issue with loading
-# the DLL in some envs is fixed.
-LOADED_WHISPER_DLL = False
-try:
-    import buzz.whisper_cpp as whisper_cpp
-
-    LOADED_WHISPER_DLL = True
-except ImportError:
-    logging.exception("")
+if sys.platform != "linux":
+    import faster_whisper
+    import whisper
+    import stable_whisper
 
 DEFAULT_WHISPER_TEMPERATURE = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
@@ -55,7 +50,108 @@ class Segment:
     text: str
 
 
-LANGUAGES = tokenizer.LANGUAGES
+LANGUAGES = {
+    "en": "english",
+    "zh": "chinese",
+    "de": "german",
+    "es": "spanish",
+    "ru": "russian",
+    "ko": "korean",
+    "fr": "french",
+    "ja": "japanese",
+    "pt": "portuguese",
+    "tr": "turkish",
+    "pl": "polish",
+    "ca": "catalan",
+    "nl": "dutch",
+    "ar": "arabic",
+    "sv": "swedish",
+    "it": "italian",
+    "id": "indonesian",
+    "hi": "hindi",
+    "fi": "finnish",
+    "vi": "vietnamese",
+    "he": "hebrew",
+    "uk": "ukrainian",
+    "el": "greek",
+    "ms": "malay",
+    "cs": "czech",
+    "ro": "romanian",
+    "da": "danish",
+    "hu": "hungarian",
+    "ta": "tamil",
+    "no": "norwegian",
+    "th": "thai",
+    "ur": "urdu",
+    "hr": "croatian",
+    "bg": "bulgarian",
+    "lt": "lithuanian",
+    "la": "latin",
+    "mi": "maori",
+    "ml": "malayalam",
+    "cy": "welsh",
+    "sk": "slovak",
+    "te": "telugu",
+    "fa": "persian",
+    "lv": "latvian",
+    "bn": "bengali",
+    "sr": "serbian",
+    "az": "azerbaijani",
+    "sl": "slovenian",
+    "kn": "kannada",
+    "et": "estonian",
+    "mk": "macedonian",
+    "br": "breton",
+    "eu": "basque",
+    "is": "icelandic",
+    "hy": "armenian",
+    "ne": "nepali",
+    "mn": "mongolian",
+    "bs": "bosnian",
+    "kk": "kazakh",
+    "sq": "albanian",
+    "sw": "swahili",
+    "gl": "galician",
+    "mr": "marathi",
+    "pa": "punjabi",
+    "si": "sinhala",
+    "km": "khmer",
+    "sn": "shona",
+    "yo": "yoruba",
+    "so": "somali",
+    "af": "afrikaans",
+    "oc": "occitan",
+    "ka": "georgian",
+    "be": "belarusian",
+    "tg": "tajik",
+    "sd": "sindhi",
+    "gu": "gujarati",
+    "am": "amharic",
+    "yi": "yiddish",
+    "lo": "lao",
+    "uz": "uzbek",
+    "fo": "faroese",
+    "ht": "haitian creole",
+    "ps": "pashto",
+    "tk": "turkmen",
+    "nn": "nynorsk",
+    "mt": "maltese",
+    "sa": "sanskrit",
+    "lb": "luxembourgish",
+    "my": "myanmar",
+    "bo": "tibetan",
+    "tl": "tagalog",
+    "mg": "malagasy",
+    "as": "assamese",
+    "tt": "tatar",
+    "haw": "hawaiian",
+    "ln": "lingala",
+    "ha": "hausa",
+    "ba": "bashkir",
+    "jw": "javanese",
+    "su": "sundanese",
+    "yue": "cantonese",
+}
 
 
 @dataclass()
@@ -69,6 +165,12 @@ class TranscriptionOptions:
     openai_access_token: str = field(
         default="", metadata=config(exclude=Exclude.ALWAYS)
     )
+
+
+def humanize_language(language: str) -> str:
+    if language == "":
+        return _("Detect Language")
+    return LANGUAGES[language].title()
 
 
 @dataclass()
@@ -88,6 +190,10 @@ class FileTranscriptionTask:
         FAILED = "failed"
         CANCELED = "canceled"
 
+    class Source(enum.Enum):
+        FILE_IMPORT = "file_import"
+        FOLDER_WATCH = "folder_watch"
+
     file_path: str
     transcription_options: TranscriptionOptions
     file_transcription_options: FileTranscriptionOptions
@@ -100,6 +206,38 @@ class FileTranscriptionTask:
     queued_at: Optional[datetime.datetime] = None
     started_at: Optional[datetime.datetime] = None
     completed_at: Optional[datetime.datetime] = None
+    output_directory: Optional[str] = None
+    source: Source = Source.FILE_IMPORT
+
+    def status_text(self) -> str:
+        if self.status == FileTranscriptionTask.Status.IN_PROGRESS:
+            return f'{_("In Progress")} ({self.fraction_completed :.0%})'
+        elif self.status == FileTranscriptionTask.Status.COMPLETED:
+            status = _("Completed")
+            if self.started_at is not None and self.completed_at is not None:
+                status += (
+                    f" ({self.format_timedelta(self.completed_at - self.started_at)})"
+                )
+            return status
+        elif self.status == FileTranscriptionTask.Status.FAILED:
+            return f'{_("Failed")} ({self.error})'
+        elif self.status == FileTranscriptionTask.Status.CANCELED:
+            return _("Canceled")
+        elif self.status == FileTranscriptionTask.Status.QUEUED:
+            return _("Queued")
+        return ""
+
+    @staticmethod
+    def format_timedelta(delta: datetime.timedelta):
+        mm, ss = divmod(delta.seconds, 60)
+        result = f"{ss}s"
+        if mm == 0:
+            return result
+        hh, mm = divmod(mm, 60)
+        result = f"{mm}m {result}"
+        if hh == 0:
+            return result
+        return f"{hh}h {result}"
 
 
 class OutputFormat(enum.Enum):
@@ -123,6 +261,7 @@ class FileTranscriber(QObject):
         try:
             segments = self.transcribe()
         except Exception as exc:
+            logging.error(exc)
             self.error.emit(exc)
             return
 
@@ -131,12 +270,21 @@ class FileTranscriber(QObject):
         for (
             output_format
         ) in self.transcription_task.file_transcription_options.output_formats:
-            default_path = get_default_output_file_path(
+            default_path = get_output_file_path(
                 task=self.transcription_task, output_format=output_format
             )
 
             write_output(
                 path=default_path, segments=segments, output_format=output_format
+            )
+
+        if self.transcription_task.source == FileTranscriptionTask.Source.FOLDER_WATCH:
+            shutil.move(
+                self.transcription_task.file_path,
+                os.path.join(
+                    self.transcription_task.output_directory,
+                    os.path.basename(self.transcription_task.file_path),
+                ),
             )
 
     @abstractmethod
@@ -176,8 +324,8 @@ class WhisperCppFileTranscriber(FileTranscriber):
         model_path = self.model_path
 
         logging.debug(
-            "Starting whisper_cpp file transcription, file path = %s, language = %s, task = %s, model_path = %s, "
-            "word level timings = %s",
+            "Starting whisper_cpp file transcription, file path = %s, language = %s, "
+            "task = %s, model_path = %s, word level timings = %s",
             self.file_path,
             self.language,
             self.task,
@@ -185,8 +333,8 @@ class WhisperCppFileTranscriber(FileTranscriber):
             self.word_level_timings,
         )
 
-        audio = whisper.audio.load_audio(self.file_path)
-        self.duration_audio_ms = len(audio) * 1000 / whisper.audio.SAMPLE_RATE
+        audio = whisper_audio.load_audio(self.file_path)
+        self.duration_audio_ms = len(audio) * 1000 / whisper_audio.SAMPLE_RATE
 
         whisper_params = whisper_cpp_params(
             language=self.language if self.language is not None else "",
@@ -241,6 +389,9 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
         super().__init__(task=task, parent=parent)
         self.file_path = task.file_path
         self.task = task.transcription_options.task
+        self.openai_client = OpenAI(
+            api_key=self.transcription_task.transcription_options.openai_access_token
+        )
 
     def transcribe(self) -> List[Segment]:
         logging.debug(
@@ -249,21 +400,9 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
             self.task,
         )
 
-        wav_file = tempfile.mktemp() + ".wav"
+        mp3_file = tempfile.mktemp() + ".mp3"
 
-        # fmt: off
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-threads", "0",
-            "-i", self.file_path,
-            "-f", "s16le",
-            "-ac", "1",
-            "-acodec", "pcm_s16le",
-            "-ar", str(whisper.audio.SAMPLE_RATE),
-            wav_file,
-        ]
-        # fmt: on
+        cmd = ["ffmpeg", "-i", self.file_path, mp3_file]
 
         try:
             subprocess.run(cmd, capture_output=True, check=True)
@@ -271,33 +410,84 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
             logging.exception("")
             raise Exception(exc.stderr.decode("utf-8"))
 
-        # TODO: Check if file size is more than 25MB (2.5 minutes), then chunk
-        audio_file = open(wav_file, "rb")
-        openai.api_key = (
-            self.transcription_task.transcription_options.openai_access_token
+        # fmt: off
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            mp3_file,
+        ]
+        # fmt: on
+        duration_secs = float(
+            subprocess.run(cmd, capture_output=True, check=True).stdout.decode("utf-8")
         )
-        language = self.transcription_task.transcription_options.language
-        response_format = "verbose_json"
-        if self.transcription_task.transcription_options.task == Task.TRANSLATE:
-            transcript = openai.Audio.translate(
-                "whisper-1",
-                audio_file,
-                response_format=response_format,
-                language=language,
-            )
-        else:
-            transcript = openai.Audio.transcribe(
-                "whisper-1",
-                audio_file,
-                response_format=response_format,
-                language=language,
-            )
 
-        segments = [
-            Segment(segment["start"] * 1000, segment["end"] * 1000, segment["text"])
+        total_size = os.path.getsize(mp3_file)
+        max_chunk_size = 25 * 1024 * 1024
+
+        self.progress.emit((0, 100))
+
+        if total_size < max_chunk_size:
+            return self.get_segments_for_file(mp3_file)
+
+        # If the file is larger than 25MB, split into chunks
+        # and transcribe each chunk separately
+        num_chunks = math.ceil(total_size / max_chunk_size)
+        chunk_duration = duration_secs / num_chunks
+
+        segments = []
+
+        for i in range(num_chunks):
+            chunk_start = i * chunk_duration
+            chunk_end = min((i + 1) * chunk_duration, duration_secs)
+
+            chunk_file = tempfile.mktemp() + ".mp3"
+
+            # fmt: off
+            cmd = [
+                "ffmpeg",
+                "-i", mp3_file,
+                "-ss", str(chunk_start),
+                "-to", str(chunk_end),
+                "-c", "copy",
+                chunk_file,
+            ]
+            # fmt: on
+            subprocess.run(cmd, capture_output=True, check=True)
+            logging.debug('Created chunk file "%s"', chunk_file)
+
+            segments.extend(
+                self.get_segments_for_file(
+                    chunk_file, offset_ms=int(chunk_start * 1000)
+                )
+            )
+            os.remove(chunk_file)
+            self.progress.emit((i + 1, num_chunks))
+
+        return segments
+
+    def get_segments_for_file(self, file: str, offset_ms: int = 0):
+        kwargs = {
+            "model": "whisper-1",
+            "file": file,
+            "response_format": "verbose_json",
+            "language": self.transcription_task.transcription_options.language,
+        }
+        transcript = (
+            self.openai_client.audio.transcriptions.create(**kwargs)
+            if self.transcription_task.transcription_options.task == Task.TRANSLATE
+            else self.openai_client.audio.translations.create(**kwargs)
+        )
+
+        return [
+            Segment(
+                int(segment["start"] * 1000 + offset_ms),
+                int(segment["end"] * 1000 + offset_ms),
+                segment["text"],
+            )
             for segment in transcript["segments"]
         ]
-        return segments
 
     def stop(self):
         pass
@@ -562,24 +752,22 @@ def segments_to_text(segments: List[Segment]) -> str:
 
 def to_timestamp(ms: float, ms_separator=".") -> str:
     hr = int(ms / (1000 * 60 * 60))
-    ms = ms - hr * (1000 * 60 * 60)
+    ms -= hr * (1000 * 60 * 60)
     min = int(ms / (1000 * 60))
-    ms = ms - min * (1000 * 60)
+    ms -= min * (1000 * 60)
     sec = int(ms / 1000)
     ms = int(ms - sec * 1000)
     return f"{hr:02d}:{min:02d}:{sec:02d}{ms_separator}{ms:03d}"
 
 
-SUPPORTED_OUTPUT_FORMATS = "Audio files (*.mp3 *.wav *.m4a *.ogg);;\
+SUPPORTED_AUDIO_FORMATS = "Audio files (*.mp3 *.wav *.m4a *.ogg);;\
 Video files (*.mp4 *.webm *.ogm *.mov);;All files (*.*)"
 
 
-def get_default_output_file_path(
-    task: FileTranscriptionTask, output_format: OutputFormat
-):
-    input_file_name = os.path.splitext(task.file_path)[0]
+def get_output_file_path(task: FileTranscriptionTask, output_format: OutputFormat):
+    input_file_name = os.path.splitext(os.path.basename(task.file_path))[0]
     date_time_now = datetime.datetime.now().strftime("%d-%b-%Y %H-%M-%S")
-    return (
+    output_file_name = (
         task.file_transcription_options.default_output_file_name.replace(
             "{{ input_file_name }}", input_file_name
         )
@@ -595,6 +783,9 @@ def get_default_output_file_path(
         .replace("{{ date_time }}", date_time_now)
         + f".{output_format.value}"
     )
+
+    output_directory = task.output_directory or os.path.dirname(task.file_path)
+    return os.path.join(output_directory, output_file_name)
 
 
 def whisper_cpp_params(
@@ -623,7 +814,7 @@ class WhisperCpp:
 
     def transcribe(self, audio: Union[np.ndarray, str], params: Any):
         if isinstance(audio, str):
-            audio = whisper.audio.load_audio(audio)
+            audio = whisper_audio.load_audio(audio)
 
         logging.debug("Loaded audio with length = %s", len(audio))
 
