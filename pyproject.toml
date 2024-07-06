@@ -14,7 +14,7 @@ packages = [
 [tool.poetry.dependencies]
 python = ">=3.9.13,<3.11"
 sounddevice = "^0.4.5"
-torch = "1.12.1"
+torch = "1.13.1"
 transformers = "~4.24.0"
 appdirs = "^1.4.4"
 humanize = "^4.4.0"
